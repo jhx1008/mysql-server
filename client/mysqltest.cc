@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -35,6 +35,7 @@
 #include <my_dir.h>
 #include <hash.h>
 #include <stdarg.h>
+#include <string>
 #include <violite.h>
 #include "my_regex.h" /* Our own version of regex */
 #include "my_thread_local.h"
@@ -57,6 +58,7 @@
 
 using std::min;
 using std::max;
+using std::string;
 
 #ifdef _WIN32
 #include <crtdbg.h>
@@ -2985,16 +2987,20 @@ int open_file(const char *name)
   DBUG_ENTER("open_file");
   DBUG_PRINT("enter", ("name: %s", name));
 
+  my_bool file_exists= false;
   /* Extract path from current file and try it as base first */
   if (dirname_part(buff, cur_file->file_name, &length))
   {
     strxmov(buff, buff, name, NullS);
-    if (access(buff, F_OK) == 0){
+    if (access(buff, F_OK) == 0)
+    {
       DBUG_PRINT("info", ("The file exists"));
       name= buff;
+      file_exists= true;
     }
   }
-  if (!test_if_hard_path(name))
+
+  if (!test_if_hard_path(name) && !file_exists)
   {
     strxmov(buff, opt_basedir, name, NullS);
     name=buff;
@@ -4422,7 +4428,11 @@ void do_perl(struct st_command *command)
       die("Failed to create temporary file for perl command");
     my_close(fd, MYF(0));
 
-    str_to_file(temp_file_path, ds_script.str, ds_script.length);
+    /* Compatibility for Perl 5.24 and newer. */
+    string script = "push @INC, \".\";\n";
+    script.append(ds_script.str, ds_script.length);
+
+    str_to_file(temp_file_path, &script[0], script.size());
 
     /* Format the "perl <filename>" command */
     my_snprintf(buf, sizeof(buf), "perl %s", temp_file_path);
@@ -5052,7 +5062,7 @@ static void abort_process(int pid, const char *path)
       /* Make sure "/mysqld.nnnnnnnnnn.dmp" fits */
       if ((end - name) < (sizeof(name) - 23))
       {
-        if (end[-1] != FN_LIBCHAR && end[-1] != FN_LIBCHAR2)
+        if (!is_directory_separator(end[-1]))
         {
           end[0]= FN_LIBCHAR2;   // datadir path normally uses '/'.
           end++;
@@ -7366,6 +7376,7 @@ void init_win_path_patterns()
                           "$MYSQLTEST_VARDIR",
                           "$MASTER_MYSOCK",
                           "$MYSQL_SHAREDIR",
+                          "$MYSQL_CHARSETSDIR",
                           "$MYSQL_LIBDIR",
                           "./test/",
                           ".ibd",

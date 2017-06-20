@@ -89,6 +89,7 @@ C_MODE_START
 #define MY_RESOLVE_LINK 128	/* my_realpath(); Only resolve links */
 #define MY_HOLD_ORIGINAL_MODES 128  /* my_copy() holds to file modes */
 #define MY_REDEL_MAKE_BACKUP 256
+#define MY_REDEL_NO_COPY_STAT 512 /* my_redel() doesn't call my_copystat() */
 #define MY_SEEK_NOT_DONE 32	/* my_lock may have to do a seek */
 #define MY_DONT_WAIT	64	/* my_lock() don't wait if can't lock */
 #define MY_ZEROFILL	32	/* my_malloc(), fill array with zero */
@@ -218,7 +219,7 @@ extern void (*fatal_error_handler_hook)(uint my_err, const char *str,
 extern void (*local_message_hook)(enum loglevel ll,
                                   const char *format, va_list args);
 extern uint my_file_limit;
-extern ulong my_thread_stack_size;
+extern MYSQL_PLUGIN_IMPORT ulong my_thread_stack_size;
 
 /*
   Hooks for reporting execution stage information. The server implementation
@@ -680,7 +681,6 @@ extern size_t cleanup_dirname(char * to,const char *from);
 extern size_t system_filename(char * to,const char *from);
 extern size_t unpack_filename(char * to,const char *from);
 extern char * intern_filename(char * to,const char *from);
-extern char * directory_file_name(char * dst, const char *src);
 extern int pack_filename(char * to, const char *name, size_t max_length);
 extern char * my_path(char * to,const char *progname,
 			 const char *own_pathname_part);
@@ -853,6 +853,14 @@ extern my_bool my_gethwaddr(uchar *to);
 
 #ifndef MAP_NOSYNC
 #define MAP_NOSYNC      0
+#endif
+
+/*
+  Not defined in FreeBSD 11.
+  Was never implemented in FreeBSD, so we just set it to 0.
+*/
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
 #endif
 
 #ifdef HAVE_MMAP64

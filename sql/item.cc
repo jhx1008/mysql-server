@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1031,29 +1031,6 @@ bool Item_field::find_item_in_field_list_processor(uchar *arg)
       return TRUE;
   }
   return FALSE;
-}
-
-
-/**
-  Mark field in read or write map of a table.
-
-  @param arg Struct that tells which map to update and how
-           table If = NULL, update map of any table
-                 If <> NULL, update map only if field is from this table
-           mark  How to mark current column
-*/
-
-bool Item_field::mark_field_in_map(uchar *arg)
-{
-  Mark_field *mark_field= (Mark_field *)arg;
-  TABLE *table= mark_field->table;
-  if (table != NULL && table != field->table)
-    return false;
-
-  table= field->table;
-  table->mark_column_used(table->in_use, field, mark_field->mark);
-
-  return false;
 }
 
 
@@ -3865,12 +3842,11 @@ void Item_param::set_time(MYSQL_TIME *tm, timestamp_type time_type,
 
   value.time= *tm;
   value.time.time_type= time_type;
+  decimals= tm->second_part ? DATETIME_MAX_DECIMALS : 0;
 
   if (check_datetime_range(&value.time))
   {
-    make_truncated_value_warning(ErrConvString(&value.time,
-                                               MY_MIN(decimals,
-                                                      DATETIME_MAX_DECIMALS)),
+    make_truncated_value_warning(ErrConvString(&value.time, decimals),
                                  time_type);
     set_zero_time(&value.time, MYSQL_TIMESTAMP_ERROR);
   }
@@ -3878,7 +3854,6 @@ void Item_param::set_time(MYSQL_TIME *tm, timestamp_type time_type,
   state= TIME_VALUE;
   maybe_null= 0;
   max_length= max_length_arg;
-  decimals= 0;
   DBUG_VOID_RETURN;
 }
 
@@ -5623,6 +5598,28 @@ Item_field::fix_outer_field(THD *thd, Field **from_field, Item **reference)
           prev_subselect_item->used_tables_cache|= ut.used_tables;
           prev_subselect_item->const_item_cache&=
             (*reference)->const_item();
+
+          if (select->group_list.elements && place == CTX_HAVING)
+          {
+            /*
+              If an outer field is resolved in a grouping query block then it
+              is replaced with an Item_outer_ref object. Otherwise an
+              Item_field object is used.
+              The new Item_outer_ref object is saved in the inner_refs_list of
+              the outer query block. Here it is only created. It can be fixed
+              only after the original field has been fixed and this is done
+              in the fix_inner_refs() function.
+            */
+            Item_outer_ref *const rf=
+              new Item_outer_ref(context, down_cast<Item_ident *>(*reference));
+            if (rf == NULL)
+              return -1;
+            thd->change_item_tree(reference, rf);
+            if (select->inner_refs_list.push_back(rf))
+              return -1;
+            rf->in_sum_func= thd->lex->in_sum_func;
+          }
+
           if (thd->lex->in_sum_func &&
               thd->lex->in_sum_func->nest_level >= select->nest_level)
             set_if_bigger(thd->lex->in_sum_func->max_arg_level,
@@ -10956,4 +10953,26 @@ bool Item_ident::is_column_not_in_fd(uchar *arg)
 {
   Group_check *const gc= reinterpret_cast<Group_check *>(arg);
   return gc->do_ident_check(this, 0, Group_check::CHECK_COLUMN);
+}
+
+/**
+   The aim here is to find a real_item() which is of type Item_field.
+*/
+bool Item_ref::repoint_const_outer_ref(uchar *arg)
+{
+  *(pointer_cast<bool*>(arg))= true;
+  return false;
+}
+
+/**
+   If this object is the real_item of an Item_ref, repoint the result_field to
+   field.
+*/
+bool Item_field::repoint_const_outer_ref(uchar *arg)
+{
+  bool *is_outer_ref= pointer_cast<bool*>(arg);
+  if (*is_outer_ref)
+    result_field= field;
+  *is_outer_ref= false;
+  return false;
 }

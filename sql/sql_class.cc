@@ -67,7 +67,7 @@ using std::max;
   The following is used to initialise Table_ident with a internal
   table name
 */
-char internal_table_name[2]= "*";
+char internal_table_name[2]= "";
 char empty_c_string[1]= {0};    /* used for not defined db */
 
 LEX_STRING EMPTY_STR= { (char *) "", 0 };
@@ -1061,6 +1061,7 @@ THD::THD(bool enable_plugins)
    initial_status_var(NULL),
    status_var_aggregated(false),
    query_plan(this),
+   m_current_stage_key(0),
    current_mutex(NULL),
    current_cond(NULL),
    in_sub_stmt(0),
@@ -1117,7 +1118,7 @@ THD::THD(bool enable_plugins)
    m_query_rewrite_plugin_da(false),
    m_query_rewrite_plugin_da_ptr(&m_query_rewrite_plugin_da),
    m_stmt_da(&main_da),
-   duplicate_slave_uuid(false),
+   duplicate_slave_id(false),
    is_a_srv_session_thd(false)
 {
   main_lex.reset();
@@ -1406,7 +1407,8 @@ struct timeval THD::query_start_timeval_trunc(uint decimals)
 Sql_condition* THD::raise_condition(uint sql_errno,
                                     const char* sqlstate,
                                     Sql_condition::enum_severity_level level,
-                                    const char* msg)
+                                    const char* msg,
+                                    bool use_condition_handler)
 {
   DBUG_ENTER("THD::raise_condition");
 
@@ -1422,7 +1424,8 @@ Sql_condition* THD::raise_condition(uint sql_errno,
   if (sqlstate == NULL)
    sqlstate= mysql_errno_to_sqlstate(sql_errno);
 
-  if (handle_condition(sql_errno, sqlstate, &level, msg))
+  if (use_condition_handler &&
+      handle_condition(sql_errno, sqlstate, &level, msg))
     DBUG_RETURN(NULL);
 
   if (level == Sql_condition::SL_NOTE || level == Sql_condition::SL_WARNING)
@@ -1742,6 +1745,14 @@ void THD::cleanup(void)
   my_hash_free(&user_vars);
   mysql_mutex_unlock(&LOCK_thd_data);
 
+  /*
+    When we call drop table for temporary tables, the
+    user_var_events container is not cleared this might
+    cause error if the container was filled before the
+    drop table command is called.
+    So call this before calling close_temporary_tables.
+  */
+  user_var_events.clear();
   close_temporary_tables(this);
   sp_cache_clear(&sp_proc_cache);
   sp_cache_clear(&sp_func_cache);
@@ -4733,28 +4744,32 @@ void THD::claim_memory_ownership()
 }
 
 
-bool THD::binlog_applier_need_detach_trx()
+void THD::rpl_detach_engine_ha_data()
 {
 #ifdef HAVE_REPLICATION
-  return is_binlog_applier() ? rli_fake->is_native_trx_detached= true : false;
-#else
-  return false;
+  Relay_log_info *rli=
+    is_binlog_applier() ? rli_fake : (slave_thread ? rli_slave : NULL);
+
+  DBUG_ASSERT(!rli_fake  || !rli_fake-> is_engine_ha_data_detached);
+  DBUG_ASSERT(!rli_slave || !rli_slave->is_engine_ha_data_detached);
+
+  if (rli)
+    rli->detach_engine_ha_data(this);
 #endif
 };
 
 
-bool THD::binlog_applier_has_detached_trx()
+bool THD::rpl_unflag_detached_engine_ha_data()
 {
 #ifdef HAVE_REPLICATION
-  bool rc= is_binlog_applier() && rli_fake->is_native_trx_detached;
-
-  if (rc)
-    rli_fake->is_native_trx_detached= false;
-  return rc;
+  Relay_log_info *rli=
+    is_binlog_applier() ? rli_fake : (slave_thread ? rli_slave : NULL);
+  return rli ? rli->unflag_detached_engine_ha_data() : false;
 #else
   return false;
 #endif
 }
+
 /**
   Determine if binlogging is disabled for this session
   @retval 0 if the current statement binlogging is disabled

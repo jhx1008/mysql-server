@@ -31,6 +31,7 @@
 #include "sql_authentication.h"
 #include "sql_authorization.h"
 #include "debug_sync.h"
+#include "sql_user_table.h"
 
 const char *command_array[]=
 {
@@ -180,14 +181,13 @@ bool select_precheck(THD *thd, LEX *lex, TABLE_LIST *tables,
 
 bool Sql_cmd_update::multi_update_precheck(THD *thd, TABLE_LIST *tables)
 {
-  LEX *lex= thd->lex;
   DBUG_ENTER("multi_update_precheck");
 
   /*
     Ensure that we have UPDATE or SELECT privilege for each table
     The exact privilege is checked in mysql_multi_update()
   */
-  for (TABLE_LIST *table= tables; table; table= table->next_local)
+  for (TABLE_LIST *table= tables; table; table= table->next_global)
   {
     /*
       "uses_materialization()" covers the case where a prepared statement is
@@ -208,25 +208,6 @@ bool Sql_cmd_update::multi_update_precheck(THD *thd, TABLE_LIST *tables)
       DBUG_RETURN(TRUE);
 
     table->table_in_first_from_clause= 1;
-  }
-  /*
-    Is there tables of subqueries?
-  */
-  if (lex->select_lex != lex->all_selects_list)
-  {
-    DBUG_PRINT("info",("Checking sub query list"));
-    for (TABLE_LIST *table= tables; table; table= table->next_global)
-    {
-      if (!table->table_in_first_from_clause)
-      {
-	if (check_access(thd, SELECT_ACL, table->db,
-                         &table->grant.privilege,
-                         &table->grant.m_internal,
-                         0, 0) ||
-	    check_grant(thd, SELECT_ACL, table, FALSE, 1, FALSE))
-	  DBUG_RETURN(TRUE);
-      }
-    }
   }
 
   DBUG_RETURN(FALSE);
@@ -515,16 +496,6 @@ bool check_readonly(THD *thd, bool err_if_readonly)
 
   /* thread is replication slave, do not prohibit operation: */
   if (thd->slave_thread)
-    DBUG_RETURN(FALSE);
-
-  /* Permit replication operations. */
-  enum enum_sql_command sql_command= thd->lex->sql_command;
-  if (sql_command == SQLCOM_SLAVE_START ||
-      sql_command == SQLCOM_SLAVE_STOP ||
-      sql_command == SQLCOM_CHANGE_MASTER ||
-      sql_command == SQLCOM_START_GROUP_REPLICATION ||
-      sql_command == SQLCOM_STOP_GROUP_REPLICATION ||
-      sql_command == SQLCOM_CHANGE_REPLICATION_FILTER)
     DBUG_RETURN(FALSE);
 
   bool is_super = thd->security_context()->check_access(SUPER_ACL);
@@ -1478,8 +1449,7 @@ int mysql_table_grant(THD *thd, TABLE_LIST *table_list,
     additional privileges on the slave).
     Before ACLs are changed to execute fully or none at all, when
     some error happens, write an incident if one or more users are
-    granted/revoked successfully (it has a partial execution), a
-    warning if no user is granted/revoked successfully.
+    granted/revoked successfully (it has a partial execution).
   */
   if (result)
   {
@@ -1492,10 +1462,6 @@ int mysql_table_grant(THD *thd, TABLE_LIST *table_list,
         mysql_bin_log.write_incident(thd, true /* need_lock_log=true */,
                                      err_msg);
       }
-      else
-        sql_print_warning("Did not write failed '%s' into binary log while "
-                          "storing table level and column level grants in "
-                          "the privilege tables.", thd->query().str);
     }
   }
   else
@@ -1739,8 +1705,7 @@ bool mysql_routine_grant(THD *thd, TABLE_LIST *table_list, bool is_proc,
     /*
       Before ACLs are changed to execute fully or none at all, when
       some error happens, write an incident if one or more users are
-      granted/revoked successfully (it has a partial execution), a
-      warning if no user is granted/revoked successfully.
+      granted/revoked successfully (it has a partial execution).
     */
     if (result)
     {
@@ -1753,10 +1718,6 @@ bool mysql_routine_grant(THD *thd, TABLE_LIST *table_list, bool is_proc,
           mysql_bin_log.write_incident(thd, true /* need_lock_log=true */,
                                        err_msg);
         }
-        else
-          sql_print_warning("Did not write failed '%s' into binary log while "
-                            "storing routine level grants in the privilege "
-                            "tables.", thd->query().str);
       }
     }
     else
@@ -2009,8 +1970,7 @@ bool mysql_grant(THD *thd, const char *db, List <LEX_USER> &list,
   /*
     Before ACLs are changed to execute fully or none at all, when
     some error happens, write an incident if one or more users are
-    granted/revoked successfully (it has a partial execution), a
-    warning if no user is granted/revoked successfully.
+    granted/revoked successfully (it has a partial execution).
   */
   if (result)
   {
@@ -2023,10 +1983,6 @@ bool mysql_grant(THD *thd, const char *db, List <LEX_USER> &list,
         mysql_bin_log.write_incident(thd, true /* need_lock_log=true */,
                                      err_msg);
       }
-      else
-        sql_print_warning("Did not write failed '%s' into binary log while "
-                          "granting/revoking privileges in databases.",
-                          thd->query().str);
     }
   }
   else
@@ -3470,8 +3426,7 @@ user_end:
   /*
     Before ACLs are changed to execute fully or none at all, when
     some error happens, write an incident if one or more users are
-    revoked successfully (it has a partial execution), a warning
-    if no user is granted/revoked successfully.
+    revoked successfully (it has a partial execution).
   */
   if (result)
   {
@@ -3485,10 +3440,6 @@ user_end:
         mysql_bin_log.write_incident(thd, true /* need_lock_log=true */,
                                      err_msg);
       }
-      else
-        sql_print_warning("Did not write failed '%s' into binary log while "
-                          "revoking all_privileges from a list of users.",
-                          thd->query().str);
     }
   }
   else

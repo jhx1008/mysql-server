@@ -216,17 +216,7 @@ int ha_recover(HASH *commit_list)
 }
 
 
-/**
-  Rollback the active XA transaction.
-
-  @note Resets rm_error before calling ha_rollback(), so
-        the thd->transaction.xid structure gets reset
-        by ha_rollback() / THD::transaction::cleanup().
-
-  @return true if the rollback failed, false otherwise.
-*/
-
-static bool xa_trans_force_rollback(THD *thd)
+bool xa_trans_force_rollback(THD *thd)
 {
   /*
     We must reset rm_error before calling ha_rollback(),
@@ -243,14 +233,7 @@ static bool xa_trans_force_rollback(THD *thd)
 }
 
 
-/**
-  Reset some transaction state information and delete corresponding
-  Transaction_ctx object from cache.
-
-  @param thd    Current thread
-*/
-
-static void cleanup_trans_state(THD *thd)
+void cleanup_trans_state(THD *thd)
 {
   thd->variables.option_bits&= ~OPTION_BEGIN;
   thd->server_status&=
@@ -303,39 +286,45 @@ bool Sql_cmd_xa_commit::trans_xa_commit(THD *thd)
     XID_STATE *xs= (transaction ? transaction->xid_state() : NULL);
     res= !xs || !xs->is_in_recovery();
     if (res)  // todo: fix transaction cleanup, BUG#20451386
-      my_error(ER_XAER_NOTA, MYF(0));
-    else
     {
-      DBUG_ASSERT(xs->is_in_recovery());
-      /*
-        Resumed transaction XA-commit.
-        The case deals with the "external" XA-commit by either a slave applier
-        or a different than XA-prepared transaction session.
-      */
-      res= xs->xa_trans_rolled_back();
-
-      /*
-        xs' is_binlogged() is passed through xid_state's member to low-level
-        logging routines for deciding how to log.  The same applies to
-        Rollback case.
-      */
-      if (xs->is_binlogged())
-        xid_state->set_binlogged();
-      else
-        xid_state->unset_binlogged();
-      /* Do not execute gtid wrapper whenever 'res' is true (rm error) */
-      gtid_error= MY_TEST(commit_owned_gtids(thd,
-                                             true, &need_clear_owned_gtid));
-      if (gtid_error)
-        my_error(ER_XA_RBROLLBACK, MYF(0));
-      res= res || gtid_error;
-      // todo xa framework: return an error
-      ha_commit_or_rollback_by_xid(thd, m_xid, !res);
-      xid_state->unset_binlogged();
-
-      transaction_cache_delete(transaction);
-      gtid_state_commit_or_rollback(thd, need_clear_owned_gtid, !gtid_error);
+      my_error(ER_XAER_NOTA, MYF(0));
+      DBUG_RETURN(true);
     }
+    else if (thd->in_multi_stmt_transaction_mode())
+    {
+      my_error(ER_XAER_RMFAIL, MYF(0), xid_state->state_name());
+      DBUG_RETURN(true);
+    }
+
+    DBUG_ASSERT(xs->is_in_recovery());
+    /*
+      Resumed transaction XA-commit.
+      The case deals with the "external" XA-commit by either a slave applier
+      or a different than XA-prepared transaction session.
+    */
+    res= xs->xa_trans_rolled_back();
+
+    /*
+      xs' is_binlogged() is passed through xid_state's member to low-level
+      logging routines for deciding how to log.  The same applies to
+      Rollback case.
+    */
+    if (xs->is_binlogged())
+      xid_state->set_binlogged();
+    else
+      xid_state->unset_binlogged();
+    /* Do not execute gtid wrapper whenever 'res' is true (rm error) */
+    gtid_error= MY_TEST(commit_owned_gtids(thd,
+                                           true, &need_clear_owned_gtid));
+    if (gtid_error)
+      my_error(ER_XA_RBROLLBACK, MYF(0));
+    res= res || gtid_error;
+    // todo xa framework: return an error
+    ha_commit_or_rollback_by_xid(thd, m_xid, !res);
+    xid_state->unset_binlogged();
+
+    transaction_cache_delete(transaction);
+    gtid_state_commit_or_rollback(thd, need_clear_owned_gtid, !gtid_error);
     DBUG_RETURN(res);
   }
 
@@ -397,6 +386,8 @@ bool Sql_cmd_xa_commit::trans_xa_commit(THD *thd)
       else
         res= MY_TEST(ha_commit_low(thd, /* all */ true));
 
+      DBUG_EXECUTE_IF("simulate_xa_commit_log_failure", { res= true; });
+
       if (res)
         my_error(ER_XAER_RMERR, MYF(0)); // todo/fixme: consider to rollback it
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
@@ -407,8 +398,9 @@ bool Sql_cmd_xa_commit::trans_xa_commit(THD *thd)
           we need to explicitly mark the transaction as committed.
         */
         MYSQL_COMMIT_TRANSACTION(thd->m_transaction_psi);
-        thd->m_transaction_psi= NULL;
       }
+
+      thd->m_transaction_psi= NULL;
 #endif
     }
   }
@@ -478,29 +470,34 @@ bool Sql_cmd_xa_rollback::trans_xa_rollback(THD *thd)
     Transaction_ctx *transaction= transaction_cache_search(m_xid);
     XID_STATE *xs= (transaction ? transaction->xid_state() : NULL);
     if (!xs || !xs->is_in_recovery())
-      my_error(ER_XAER_NOTA, MYF(0));
-    else
     {
-      bool gtid_error= false;
-
-      DBUG_ASSERT(xs->is_in_recovery());
-      /*
-        Like in the commit case a failure to store gtid is regarded
-        as the resource manager issue.
-      */
-      if ((gtid_error= commit_owned_gtids(thd, true, &need_clear_owned_gtid)))
-        my_error(ER_XA_RBROLLBACK, MYF(0));
-      xs->xa_trans_rolled_back();
-      if (xs->is_binlogged())
-        xid_state->set_binlogged();
-      else
-        xid_state->unset_binlogged();
-      ha_commit_or_rollback_by_xid(thd, m_xid, false);
-      xid_state->unset_binlogged();
-      transaction_cache_delete(transaction);
-      gtid_state_commit_or_rollback(thd, need_clear_owned_gtid, !gtid_error);
+      my_error(ER_XAER_NOTA, MYF(0));
+      DBUG_RETURN(true);
+    }
+    else if (thd->in_multi_stmt_transaction_mode())
+    {
+      my_error(ER_XAER_RMFAIL, MYF(0), xid_state->state_name());
+      DBUG_RETURN(true);
     }
 
+    bool gtid_error= false;
+
+    DBUG_ASSERT(xs->is_in_recovery());
+    /*
+      Like in the commit case a failure to store gtid is regarded
+      as the resource manager issue.
+    */
+    if ((gtid_error= commit_owned_gtids(thd, true, &need_clear_owned_gtid)))
+      my_error(ER_XA_RBROLLBACK, MYF(0));
+    xs->xa_trans_rolled_back();
+    if (xs->is_binlogged())
+      xid_state->set_binlogged();
+    else
+      xid_state->unset_binlogged();
+    ha_commit_or_rollback_by_xid(thd, m_xid, false);
+    xid_state->unset_binlogged();
+    transaction_cache_delete(transaction);
+    gtid_state_commit_or_rollback(thd, need_clear_owned_gtid, !gtid_error);
     DBUG_RETURN(thd->is_error());
   }
 
@@ -615,15 +612,7 @@ bool Sql_cmd_xa_start::execute(THD *thd)
 
   if (!st)
   {
-    if (thd->binlog_applier_need_detach_trx())
-    {
-      /*
-        In case of slave thread applier or processing binlog by client,
-        detach the "native" thd's trx in favor of dynamically created.
-      */
-      plugin_foreach(thd, detach_native_trx,
-                     MYSQL_STORAGE_ENGINE_PLUGIN, NULL);
-    }
+    thd->rpl_detach_engine_ha_data();
     my_ok(thd);
   }
 
@@ -704,6 +693,12 @@ bool Sql_cmd_xa_prepare::trans_xa_prepare(THD *thd)
     DBUG_ASSERT(thd->m_transaction_psi == NULL);
 #endif
 
+    /*
+      Reset rm_error in case ha_prepare() returned error,
+      so thd->transaction.xid structure gets reset
+      by THD::transaction::cleanup().
+    */
+    thd->get_transaction()->xid_state()->reset_error();
     cleanup_trans_state(thd);
     xid_state->set_state(XID_STATE::XA_NOTR);
     thd->get_transaction()->cleanup();
@@ -729,7 +724,7 @@ bool Sql_cmd_xa_prepare::execute(THD *thd)
 
   if (!st)
   {
-    if (!thd->binlog_applier_has_detached_trx() ||
+    if (!thd->rpl_unflag_detached_engine_ha_data() ||
         !(st= applier_reset_xa_trans(thd)))
       my_ok(thd);
   }
@@ -1147,6 +1142,30 @@ void transaction_cache_delete(Transaction_ctx *transaction)
 
 
 /**
+  The function restores previously saved storage engine transaction context.
+
+  @param     thd     Thread context
+*/
+static void attach_native_trx(THD *thd)
+{
+  Ha_trx_info *ha_info=
+    thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION);
+  Ha_trx_info *ha_info_next;
+
+  if (ha_info)
+  {
+    for (; ha_info; ha_info= ha_info_next)
+    {
+      handlerton *hton= ha_info->ht();
+      reattach_engine_ha_data_to_thd(thd, hton);
+      ha_info_next= ha_info->next();
+      ha_info->reset();
+    }
+  }
+}
+
+
+/**
   This is a specific to "slave" applier collection of standard cleanup
   actions to reset XA transaction states at the end of XA prepare rather than
   to do it at the transaction commit, see @c ha_commit_one_phase.
@@ -1209,39 +1228,13 @@ my_bool detach_native_trx(THD *thd, plugin_ref plugin, void *unused)
   handlerton *hton= plugin_data<handlerton *>(plugin);
 
   if (hton->replace_native_transaction_in_thd)
+  {
+    /* Ensure any active backup engine ha_data won't be overwritten */
+    DBUG_ASSERT(!thd->ha_data[hton->slot].ha_ptr_backup);
+
     hton->replace_native_transaction_in_thd(thd, NULL,
                                             thd_ha_data_backup(thd, hton));
+  }
 
   return FALSE;
-}
-
-/**
-  The function restores previously saved storage engine transaction context.
-
-  @param     thd     Thread context
-*/
-void attach_native_trx(THD *thd)
-{
-  Ha_trx_info *ha_info=
-    thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION);
-  Ha_trx_info *ha_info_next;
-
-  if (ha_info)
-  {
-    for (; ha_info; ha_info= ha_info_next)
-    {
-      handlerton *hton= ha_info->ht();
-      if (hton->replace_native_transaction_in_thd)
-      {
-        /* restore the saved original engine transaction's link with thd */
-        void **trx_backup= thd_ha_data_backup(thd, hton);
-
-        hton->
-          replace_native_transaction_in_thd(thd, *trx_backup, NULL);
-        *trx_backup= NULL;
-      }
-      ha_info_next= ha_info->next();
-      ha_info->reset();
-    }
-  }
 }
