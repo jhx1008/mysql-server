@@ -646,7 +646,7 @@ up_rec_match:
 		}
 	}
 
-	if (mode <= PAGE_CUR_GE) {
+	if (mode <= PAGE_CUR_GE || cmp == 0) {
 		page_cur_position(up_rec, block, cursor);
 	} else {
 		page_cur_position(low_rec, block, cursor);
